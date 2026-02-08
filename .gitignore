@@ -1,0 +1,6 @@
+venv
+output/
+csv/
+plots/
+checkpoints/
+data/

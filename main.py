@@ -1,4 +1,3 @@
-# Standard library
 import difflib
 import glob
 import os
@@ -6,7 +5,6 @@ import random
 import time
 import warnings
 
-# Third-party libraries
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -17,7 +15,6 @@ import scipy.cluster.hierarchy as shc
 from scipy import stats
 from datasketch import MinHash, MinHashLSH
 
-# Scikit-learn
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.decomposition import PCA
 from sklearn.metrics import (

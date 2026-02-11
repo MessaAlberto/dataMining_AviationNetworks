@@ -15,7 +15,7 @@ import scipy.cluster.hierarchy as shc
 from scipy import stats
 from datasketch import MinHash, MinHashLSH
 
-from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+from sklearn.cluster import KMeans, DBSCAN
 from sklearn.decomposition import PCA
 from sklearn.metrics import (
     silhouette_score,
@@ -45,7 +45,7 @@ for d in [DATA_DIR, PLOT_DIR, CSV_DIR, CHECKPOINT_DIR]:
 os.chdir(DATA_DIR)
 
 # Config
-USE_CHECKPOINTS = True
+USE_CHECKPOINTS = False
 
 # ==============================================================================
 # FASE 1: DATA ENGINEERING & TRUTH CONSTRUCTION
@@ -499,30 +499,18 @@ else:
     # PRINT SUMMARY STATISTICS
     # ---------------------------
     print("\nNetwork Centrality Summary:")
-
-    # GCC info
     print(f"    - GCC Size: {len(G_gcc)} nodes ({len(G_gcc)/len(G):.1%} of total)")
-
-    # Degree stats
     print(f"    - In-Degree: min={df_master_nodes['in_degree'].min()}, max={df_master_nodes['in_degree'].max()}, mean={df_master_nodes['in_degree'].mean():.2f}")
     print(f"    - Out-Degree: min={df_master_nodes['out_degree'].min()}, max={df_master_nodes['out_degree'].max()}, mean={df_master_nodes['out_degree'].mean():.2f}")
     print(f"    - Total Degree: min={df_master_nodes['degree'].min()}, max={df_master_nodes['degree'].max()}, mean={df_master_nodes['degree'].mean():.2f}")
-
-    # Pagerank stats
     print(f"    - PageRank: min={df_master_nodes['pagerank'].min():.6f}, max={df_master_nodes['pagerank'].max():.6f}, mean={df_master_nodes['pagerank'].mean():.6f}")
-
-    # Betweenness stats
     print(f"    - Betweenness: min={df_master_nodes['betweenness'].min():.6f}, max={df_master_nodes['betweenness'].max():.6f}, mean={df_master_nodes['betweenness'].mean():.6f}")
-
-    # Closeness stats
     if 'closeness' in df_master_nodes.columns:
         print(f"    - Closeness: min={df_master_nodes['closeness'].min():.4f}, max={df_master_nodes['closeness'].max():.4f}, mean={df_master_nodes['closeness'].mean():.4f}")
 
-    # Assortativity
     assortativity = nx.degree_assortativity_coefficient(G)
     print(f"    - Global Assortativity Coefficient: {assortativity:.4f}")
 
-    # Average nearest neighbor degree
     knn_stats = df_master_nodes['knn'].describe()
     print(f"    - Average Neighbor Degree: min={knn_stats['min']:.2f}, max={knn_stats['max']:.2f}, mean={knn_stats['mean']:.2f}")
 
@@ -759,7 +747,7 @@ plt.close()
 print("-> Saved: 02d_robustness_simulation.png")
 
 # ==============================================================================
-# FASE 3: UNSUPERVISED PROFILING ("HEALTH-BASED CLUSTERING")
+# FASE 3: CLUSTERING AIPORTS BASED ON STRUCTURAL & OPERATIONAL FEATURES
 # ==============================================================================
 print("\n" + "="*60)
 print("FASE 3: HEALTH-BASED CLUSTERING (K-MEANS + DBSCAN)")

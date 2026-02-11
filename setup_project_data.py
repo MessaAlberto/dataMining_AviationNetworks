@@ -25,8 +25,6 @@ DIRS = {
 
 BTS_YEAR = "2024"
 
-# utils
-
 
 def ensure_dirs():
     print("Directories creation:")
@@ -230,8 +228,8 @@ def process_bts():
 if __name__ == "__main__":
     print(" --- STARTING DATA RESTORE PROCESS ---")
     ensure_dirs()
-    # process_openflights()
-    # process_caa()
-    # process_anac()
+    process_openflights()
+    process_caa()
+    process_anac()
     process_bts()
     print("\n\nALL DONE! The 'data/' folder is ready for analysis.")

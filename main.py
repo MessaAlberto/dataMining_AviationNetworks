@@ -1,6 +1,7 @@
 import difflib
 import glob
 import os
+import sys
 import random
 import time
 import warnings
@@ -12,10 +13,11 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import scipy.cluster.hierarchy as shc
-from scipy import stats
+from scipy import stats as scipy_stats
 from datasketch import MinHash, MinHashLSH
 
-from sklearn.cluster import KMeans, DBSCAN
+from sklearn.cluster import KMeans as SklearnKMeans
+from sklearn.cluster import DBSCAN as SklearnDBSCAN
 from sklearn.decomposition import PCA
 from sklearn.metrics import (
     silhouette_score,
@@ -23,7 +25,11 @@ from sklearn.metrics import (
     calinski_harabasz_score
 )
 from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler as SklearnScaler
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType
 
 # Warnings and plotting config
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -39,6 +45,11 @@ PLOT_DIR = os.path.join(BASE_DIR, "plots")
 CSV_DIR = os.path.join(BASE_DIR, "csv")
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 
+OPENFLIGHTS_PATH = os.path.join(DATA_DIR, "openflights")
+BTS_PATH = os.path.join(DATA_DIR, "bts_usa")
+ANAC_PATH = os.path.join(DATA_DIR, "anac_br")
+CAA_PATH = os.path.join(DATA_DIR, "caa_uk")
+
 for d in [DATA_DIR, PLOT_DIR, CSV_DIR, CHECKPOINT_DIR]:
     os.makedirs(d, exist_ok=True)
 
@@ -46,6 +57,19 @@ os.chdir(DATA_DIR)
 
 # Config
 USE_CHECKPOINTS = False
+
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+print("Initializing Spark Session...")
+spark = SparkSession.builder \
+    .appName("AirportNetworkAnalysis") \
+    .config("spark.executor.memory", "4g") \
+    .config("spark.driver.memory", "4g") \
+    .config("spark.sql.shuffle.partitions", "200") \
+    .getOrCreate()
+
+print("Spark Session Active. UI link usually at port 4040.")
 
 # ==============================================================================
 # FASE 1: DATA ENGINEERING & TRUTH CONSTRUCTION
@@ -61,128 +85,200 @@ if USE_CHECKPOINTS and os.path.exists(ckpt_path_fase1):
     df_master_nodes, G = pd.read_pickle(ckpt_path_fase1)
 else:
     # --- 1.1 STRUCTURE BUILDING (OpenFlights) ---
-    print("Loading OpenFlights Network...")
-    df_airports = pd.read_csv("openflights/airports.csv", na_values="\\N")
-    df_nodes = df_airports[
-        df_airports["IATA"].str.match(r"^[A-Z]{3}$", na=False)
-    ][["IATA", "Name", "City", "Country", "Latitude", "Longitude"]]
+    print("Reading raw data with PySpark...")
 
-    df_routes = pd.read_csv("openflights/routes.csv", na_values="\\N")
-    df_edges = df_routes[
-        df_routes["SourceAirport"].str.match(r"^[A-Z]{3}$", na=False) &
-        df_routes["DestAirport"].str.match(r"^[A-Z]{3}$", na=False) &
-        (df_routes["Stops"] == 0)
-    ][["SourceAirport", "DestAirport"]].rename(columns={"SourceAirport": "src", "DestAirport": "dst"})
+    df_airports_spark = spark.read.option("header", "true") \
+        .option("nullValue", "\\N") \
+        .option("inferSchema", "true") \
+        .csv(os.path.join(OPENFLIGHTS_PATH, "airports.csv"))
+
+    df_routes_spark = spark.read.option("header", "true") \
+        .option("nullValue", "\\N") \
+        .option("inferSchema", "true") \
+        .csv(os.path.join(OPENFLIGHTS_PATH, "routes.csv"))
+
+    # Filter on IATA (3-letter codes)
+    df_nodes = df_airports_spark.filter(F.col("IATA").rlike("^[A-Z]{3}$")) \
+        .select("IATA", "Name", "City", "Country", "Latitude", "Longitude") \
+        .withColumn("Latitude", F.col("Latitude").cast(DoubleType())) \
+        .withColumn("Longitude", F.col("Longitude").cast(DoubleType()))
+
+    # Filter on IATA and direct flights (Stops == 0)
+    df_edges = df_routes_spark.filter(F.col("SourceAirport").rlike("^[A-Z]{3}$")) \
+        .filter(F.col("DestAirport").rlike("^[A-Z]{3}$")) \
+        .filter(F.col("Stops") == 0) \
+        .select(F.col("SourceAirport").alias("src"), F.col("DestAirport").alias("dst"))
+
+    n_nodes_init = df_nodes.count()
+    n_edges_init = df_edges.count()
+    print(f"Raw Input: {n_nodes_init} airports, {n_edges_init} routes.")
 
     # --- 1.2 TOPOLOGICAL CLEANING ---
-    print(f"Raw Input: {len(df_nodes)} airports, {len(df_edges)} routes.")
+    print("\nCleaning Graph Data...")
 
     # A. Referential Integrity (Removes routes to non-existent airports)
-    valid_iatas = set(df_nodes["IATA"].unique())
-    mask_unknown = (~df_edges["src"].isin(valid_iatas)) | (~df_edges["dst"].isin(valid_iatas))
-    num_unknown = mask_unknown.sum()
+    df_edges = df_edges.join(df_nodes, df_edges.src == df_nodes.IATA, "left_semi")
+    df_edges = df_edges.join(df_nodes, df_edges.dst == df_nodes.IATA, "left_semi")
 
-    if num_unknown > 0:
-        print(f"    - Referential Integrity: Dropping {num_unknown} phantom routes (unknown airports).")
-        df_edges = df_edges[~mask_unknown].copy()
+    n_edges_step_a = df_edges.count()
+    diff_a = n_edges_init - n_edges_step_a
+    if diff_a > 0:
+        print(f"    - Referential Integrity: Dropping {diff_a} phantom routes (unknown airports).")
 
     # B. Self-Loops
-    mask_loops = df_edges["src"] == df_edges["dst"]
-    num_loops = mask_loops.sum()
+    df_edges = df_edges.filter(F.col("src") != F.col("dst"))
 
-    if num_loops > 0:
-        print(f"    - Self-Loops: Dropping {num_loops} circular routes (src == dst).")
-        df_edges = df_edges[~mask_loops].copy()
+    n_edges_step_b = df_edges.count()
+    diff_b = n_edges_step_a - n_edges_step_b
+    if diff_b > 0:
+        print(f"    - Self-Loops: Dropping {diff_b} circular routes (src == dst).")
 
-    # C. Duplicates (Removes multiple flights on the same route operated by different airlines)
-    # Example: AA flies JFK-LHR, BA flies JFK-LHR -> becomes 1 single route JFK-LHR
-    before_dedup = len(df_edges)
-    df_edges = df_edges.drop_duplicates(subset=["src", "dst"]).copy()
-    num_dupes = before_dedup - len(df_edges)
+    # C. Duplicates
+    df_edges = df_edges.dropDuplicates(["src", "dst"])
 
-    if num_dupes > 0:
-        print(f"    - Deduplication: Merged {num_dupes} duplicate routes (multiple airlines on same edge).")
+    n_edges_step_c = df_edges.count()
+    diff_c = n_edges_step_b - n_edges_step_c
+    if diff_c > 0:
+        print(f"    - Deduplication: Merged {diff_c} duplicate routes.")
 
-    # D. Isolated Nodes (Removes airports without flights to clean clustering)
-    active_nodes = set(df_edges["src"]).union(set(df_edges["dst"]))
-    initial_nodes_len = len(df_nodes)
-    df_nodes = df_nodes[df_nodes["IATA"].isin(active_nodes)].copy()
+    # D. Isolated Nodes
+    active_src = df_edges.select(F.col("src").alias("IATA"))
+    active_dst = df_edges.select(F.col("dst").alias("IATA"))
+    active_nodes = active_src.union(active_dst).distinct()
 
-    num_isolated = initial_nodes_len - len(df_nodes)
+    # Keep only active nodes in the final node set (Semi Join)
+    df_nodes_final = df_nodes.join(active_nodes, "IATA", "left_semi")
 
-    if num_isolated > 0:
-        print(f"    - Connectivity: Dropping {num_isolated} isolated airports (noise).")
+    n_nodes_final = df_nodes_final.count()
+    diff_d = n_nodes_init - n_nodes_final
+    if diff_d > 0:
+        print(f"    - Connectivity: Dropping {diff_d} isolated airports (noise).")
 
-    print(f"Graph Cleaned: {len(df_nodes)} nodes, {len(df_edges)} edges.")
+    print(f"Graph Cleaned: {n_nodes_final} nodes, {n_edges_step_c} edges.")
+    print("\nMaterializing cleaned data to Pandas for Graph construction...")
+    pdf_nodes = df_nodes_final.toPandas()
+    pdf_edges = df_edges.toPandas()
 
     print("\nBuilding Graph G...")
-    G = nx.from_pandas_edgelist(df_edges, "src", "dst", create_using=nx.DiGraph())
-    G.add_nodes_from(df_nodes["IATA"])
+    G = nx.from_pandas_edgelist(pdf_edges, "src", "dst", create_using=nx.DiGraph())
+    G.add_nodes_from(pdf_nodes["IATA"])
 
+    node_attr = pdf_nodes.set_index("IATA")[["Name", "City", "Country", "Latitude", "Longitude"]].to_dict('index')
+    nx.set_node_attributes(G, node_attr)
+
+    df_master_nodes = pdf_nodes
     print(f"    -> Final Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges.\n")
 
     # --- 1.3 OPERATIONS DATA INTEGRATION (Delay) ---
     print("\nLoading & Aligning Performance Data...")
 
     # A. USA (BTS)
-    bts_files = glob.glob("bts_usa/*.csv")
-    df_bts_metrics = pd.DataFrame()
-    if bts_files:
-        print("Processing BTS (USA) Data...")
-        df_bts = pd.concat((pd.read_csv(f, low_memory=False) for f in bts_files), ignore_index=True)
-        print(f"    Finished loading BTS data: {len(df_bts)} records.")
-        df_bts = df_bts[(df_bts["Cancelled"] == 0) & (df_bts["Diverted"] == 0)]
-        print(f"    Filtered BTS data: {len(df_bts)} records after removing cancelled/diverted flights.")
-        df_bts_metrics = df_bts.groupby("Origin")["DepDelayMinutes"].agg(
-            avg_delay="mean", delay_variance="std", num_flights="count"
-        ).reset_index().rename(columns={"Origin": "IATA"})
-        print(f"    Aggregated BTS metrics: {len(df_bts_metrics)} unique origin airports.")
+    print("Processing BTS (USA) Data via PySpark...")
 
-        # Validity Filter
-        valid_usa = df_bts_metrics[df_bts_metrics["IATA"].isin(active_nodes)]
-        print(
-            f"-> Raw Airports: {len(df_bts_metrics)} -> Matched in Graph: {len(valid_usa)} ({len(valid_usa)/len(df_bts_metrics):.1%})")
-        df_bts_metrics = valid_usa
+    bts_files = glob.glob(os.path.join(BTS_PATH, "*.csv"))
+    if not bts_files:
+        # Erase error
+        raise ValueError(f"No BTS files found in {BTS_PATH}. Check input folder.")
+
+    df_bts_spark = spark.read.option("header", "true") \
+                        .option("inferSchema", "true") \
+                        .csv(bts_files)
+
+    print(f"    - Filtering cancelled/diverted flights...")
+    df_bts_clean = df_bts_spark.filter(
+        (F.col("Cancelled") == 0) &
+        (F.col("Diverted") == 0)
+    ).withColumn("DepDelayMinutes", F.col("DepDelayMinutes").cast("double"))
+
+    # Map-Reduce to compute metrics per airport
+    print(f"    - Computing metrics (average delay, variance, flight count) per airport...")
+    df_bts_metrics_spark = df_bts_clean.groupBy("Origin").agg(
+        F.mean("DepDelayMinutes").alias("avg_delay"),
+        F.stddev("DepDelayMinutes").alias("delay_variance"),
+        F.count("DepDelayMinutes").alias("num_flights")
+    ).withColumnRenamed("Origin", "IATA")
+
+    # .toPandas() because the result is small (one row per airport)
+    df_bts_metrics = df_bts_metrics_spark.toPandas()
+    print(f" -> USA Metrics computed. Nodes: {len(df_bts_metrics)}")
 
     # B. BRAZIL (ANAC)
-    anac_files = glob.glob("anac_br/*.csv")
-    df_anac_metrics = pd.DataFrame()
-    if anac_files:
-        print("\nProcessing ANAC (Brazil) Data...")
-        icao_to_iata = df_airports.dropna(subset=["ICAO", "IATA"]).set_index("ICAO")["IATA"].to_dict()
-        dfs = []
-        for f in anac_files:
-            try:
-                df = pd.read_csv(f, sep=";", quotechar='"', encoding='utf-8', skiprows=1, low_memory=False)
-            except:
-                df = pd.read_csv(f, sep=";", quotechar='"', encoding='latin1', skiprows=1, low_memory=False)
-            dfs.append(df)
+    print("Processing ANAC (Brazil) Data via PySpark...")
 
-        df_anac = pd.concat(dfs, ignore_index=True)
-        print(f"    Finished loading ANAC data: {len(df_anac)} records.")
-        t_real = pd.to_datetime(df_anac["Partida Real"], errors='coerce')
-        t_sched = pd.to_datetime(df_anac["Partida Prevista"], errors='coerce')
-        df_anac["delay"] = (t_real - t_sched).dt.total_seconds() / 60
-        df_anac = df_anac[(df_anac["delay"].notna()) & (df_anac["Situação Voo"] == "REALIZADO")]
-        df_anac["delay"] = df_anac["delay"].clip(lower=0)
-        print(f"    Filtered ANAC data: {len(df_anac)} records after removing invalid delays and non-realized flights.")
+    anac_files = glob.glob(os.path.join(ANAC_PATH, "*.csv"))
+    if not anac_files:
+        raise ValueError(f"No ANAC files found in {ANAC_PATH}. Check input folder.")
 
-        df_anac["IATA"] = df_anac["ICAO Aeródromo Origem"].map(icao_to_iata)
-        df_anac_metrics = df_anac.groupby("IATA")["delay"].agg(
-            avg_delay="mean", delay_variance="std", num_flights="count"
-        ).reset_index()
-        print(f"    Aggregated ANAC metrics: {len(df_anac_metrics)} unique origin airports.")
+    raw_rdd = spark.read.option("encoding", "ISO-8859-1") \
+        .text(anac_files) \
+        .rdd.map(lambda row: row[0]) \
+        .filter(lambda line: "Atualizado em" not in line)
 
-        valid_br = df_anac_metrics[df_anac_metrics["IATA"].isin(active_nodes)]
-        print(
-            f"-> Raw Airports: {len(df_anac_metrics)} -> Matched in Graph: {len(valid_br)} ({len(valid_br)/len(df_anac_metrics):.1%})")
-        df_anac_metrics = valid_br
+    # dataframe conversion
+    df_anac_spark = spark.read \
+        .option("header", "true") \
+        .option("sep", ";") \
+        .csv(raw_rdd)
+
+    df_anac_spark = df_anac_spark.filter(F.col("Situação Voo") != "Situação Voo")
+
+    print(f"DEBUG: Columns found: {df_anac_spark.columns}")
+
+    fmt = "yyyy-MM-dd HH:mm:ss"
+
+    # Convert date and filter only REALIZADO flights
+    df_anac_proc = df_anac_spark \
+        .withColumn("t_real", F.try_to_timestamp(F.col("Partida Real"), F.lit(fmt))) \
+        .withColumn("t_sched", F.try_to_timestamp(F.col("Partida Prevista"), F.lit(fmt))) \
+        .filter(F.col("Situação Voo") == "REALIZADO")
+
+    df_anac_proc = df_anac_proc.dropna(subset=["t_real", "t_sched"])
+
+    # Compute delay in minutes
+    df_anac_proc = df_anac_proc.withColumn(
+        "delay_min",
+        (F.unix_timestamp("t_real") - F.unix_timestamp("t_sched")) / 60
+    )
+    df_anac_proc = df_anac_proc.withColumn(
+        "delay_min",
+        F.when(F.col("delay_min") < 0, 0).otherwise(F.col("delay_min"))
+    )
+
+    # Aggregazione
+    df_anac_metrics_spark = df_anac_proc.groupBy("ICAO Aeródromo Origem").agg(
+        F.mean("delay_min").alias("avg_delay"),
+        F.stddev("delay_min").alias("delay_variance"),
+        F.count("delay_min").alias("num_flights")
+    )
+
+    # Convert to Pandas for post-processing (mapping ICAO->IATA)
+    df_anac_raw = df_anac_metrics_spark.toPandas()
+
+    print("Mapping ICAO to IATA for Brazil data...")
+    # Extract columns ICAO and IATA
+    mapping_pandas = df_airports_spark.select("ICAO", "IATA").dropna().toPandas()
+
+    # Create a dictionary for mapping ICAO to IATA
+    icao_to_iata = mapping_pandas.set_index("ICAO")["IATA"].to_dict()
+
+    # Apply mapping
+    df_anac_raw["IATA"] = df_anac_raw["ICAO Aeródromo Origem"].map(icao_to_iata)
+
+    # Drop rows where mapping failed
+    df_anac_metrics = df_anac_raw.dropna(subset=["IATA"]).drop(columns=["ICAO Aeródromo Origem"])
+
+    print(f" -> Brazil Metrics computed. Nodes: {len(df_anac_metrics)}")
 
     # C. UK (CAA)
-    uk_files = glob.glob("caa_uk/*.csv")
+    uk_files = glob.glob(os.path.join(CAA_PATH, "*.csv"))
     df_uk_metrics = pd.DataFrame()
     if uk_files:
-        print("\nProcessing CAA (UK) Data...")
+        print("\nProcessing CAA (UK) Data via Pandas...")
+
+        if 'df_airports' not in locals():
+            # Scarichiamo solo le colonne necessarie da Spark per essere leggeri
+            df_airports = df_airports_spark.select("IATA", "Name").toPandas()
+
         # Robust IATA Dictionary
         manual_fix = {
             "GATWICK": "LGW",
@@ -211,6 +307,7 @@ else:
             "BOURNEMOUTH": "BOH",
             "TEESSIDE INTERNATIONAL AIRPORT": "MME"
         }
+
         clean_names = df_airports.assign(
             n=df_airports["Name"].str.upper().str.replace(" AIRPORT", "").str.strip()
         ).set_index("n")["IATA"].to_dict()
@@ -243,54 +340,70 @@ else:
                 tot=("tot", "sum"), num_flights=("cnt", "sum"), delay_variance=("avg", "std")
             ).reset_index()
             df_uk_metrics["avg_delay"] = df_uk_metrics["tot"] / df_uk_metrics["num_flights"]
-            print(f"    Aggregated CAA (UK) metrics: {len(df_uk_metrics)} unique origin airports.")
-            df_uk_metrics = df_uk_metrics.drop(columns=["tot"])
 
-            valid_uk = df_uk_metrics[df_uk_metrics["IATA"].isin(active_nodes)]
+            valid_nodes_set = set(df_master_nodes["IATA"].unique())
+            valid_uk = df_uk_metrics[df_uk_metrics["IATA"].isin(valid_nodes_set)]
+
+            print(f"    Aggregated CAA (UK) metrics: {len(df_uk_metrics)} unique origin airports.")
             print(
                 f"-> Raw Airports: {len(df_uk_metrics)} -> Matched in Graph: {len(valid_uk)} ({len(valid_uk)/len(df_uk_metrics):.1%})")
-            df_uk_metrics = valid_uk
+
+            df_uk_metrics = valid_uk.drop(columns=["tot"])
 
     # --- 1.4 FINAL MERGE ---
     print("\nMerging Operational Data into Structural Graph...")
-    perf_dfs = [d for d in [df_bts_metrics, df_anac_metrics, df_uk_metrics] if not d.empty]
+    dfs_to_merge = []
 
-    if perf_dfs:
-        df_perf_global = pd.concat(perf_dfs, ignore_index=True)
-        # Final aggregation in case of overlaps (e.g., simple weighted average)
+    if 'df_bts_metrics' in locals() and df_bts_metrics is not None: dfs_to_merge.append(df_bts_metrics)
+    if 'df_anac_metrics' in locals() and df_anac_metrics is not None: dfs_to_merge.append(df_anac_metrics)
+    if 'df_uk_metrics' in locals() and df_uk_metrics is not None: dfs_to_merge.append(df_uk_metrics)
+
+    if dfs_to_merge:
+        df_perf_global = pd.concat(dfs_to_merge, ignore_index=True)
+
+        # Aggregation in case of overlaps (e.g. same airport in multiple datasets)
         df_perf_global = df_perf_global.groupby("IATA").mean().reset_index()
 
-        # Merge LEFT: Keep all graph nodes, enrich those with data
-        df_master_nodes = df_nodes.merge(df_perf_global, on="IATA", how="left")
+        # Merge LEFT: Keep all graph nodes, enrich those with available data
+        df_master_nodes = df_master_nodes.merge(df_perf_global, on="IATA", how="left")
 
-        # Final Node Audit
+        # Verify Node Coverage
         total_nodes = len(df_master_nodes)
         with_data = df_master_nodes["avg_delay"].notna().sum()
         print(f"    - Airport coverage: {with_data}/{total_nodes} nodes have delay data ({with_data/total_nodes:.1%})")
 
-        # Edge validation
         edges_in_graph = set(G.edges())
         real_routes = set()
 
-        # 1. Real routes USA (BTS)
-        if 'df_bts' in locals() and not df_bts.empty:
-            # BTS has Origin and Dest columns already in IATA format
-            bts_routes = set(zip(df_bts["Origin"], df_bts["Dest"]))
+        if 'df_bts_clean' in locals():
+            print("\nExtracting real routes from BTS data...")
+            routes_bts_spark = df_bts_clean.select("Origin", "Dest").distinct()
+            # Return to Pandas (only a few thousand routes, very light)
+            routes_bts_pd = routes_bts_spark.toPandas()
+
+            bts_routes = set(zip(routes_bts_pd["Origin"], routes_bts_pd["Dest"]))
             real_routes.update(bts_routes)
 
-        # 2. Real routes Brazil (ANAC)
-        if 'df_anac' in locals() and not df_anac.empty:
-            # ANAC uses ICAO for the destination, we need to convert it to IATA
-            if 'icao_to_iata' not in locals():
-                icao_to_iata = df_airports.dropna(subset=["ICAO", "IATA"]).set_index("ICAO")["IATA"].to_dict()
+        if 'df_anac_proc' in locals():
 
-            # Tmp columns
-            df_anac["Dest_IATA"] = df_anac["ICAO Aeródromo Destino"].map(icao_to_iata)
-            anac_valid = df_anac.dropna(subset=["IATA", "Dest_IATA"])
-            anac_routes = set(zip(anac_valid["IATA"], anac_valid["Dest_IATA"]))
+            # Note: df_anac_proc has original ICAO columns
+            routes_anac_spark = df_anac_proc.select("ICAO Aeródromo Origem", "ICAO Aeródromo Destino").distinct()
+            routes_anac_pd = routes_anac_spark.toPandas()
+
+            # Robust ICAO->IATA mapping (caching the dict to avoid repeated lookups)
+            if 'icao_to_iata' not in locals():
+                mapping_pandas = df_airports_spark.select("ICAO", "IATA").dropna().toPandas()
+                icao_to_iata = mapping_pandas.set_index("ICAO")["IATA"].to_dict()
+
+            routes_anac_pd["Src_IATA"] = routes_anac_pd["ICAO Aeródromo Origem"].map(icao_to_iata)
+            routes_anac_pd["Dst_IATA"] = routes_anac_pd["ICAO Aeródromo Destino"].map(icao_to_iata)
+
+            # Keep only rows where both IATA codes are known
+            valid_anac_routes = routes_anac_pd.dropna(subset=["Src_IATA", "Dst_IATA"])
+            anac_routes = set(zip(valid_anac_routes["Src_IATA"], valid_anac_routes["Dst_IATA"]))
             real_routes.update(anac_routes)
 
-        # 3. Calculate differences
+        # Calculate Differences and Update Graph
         if real_routes:
             total_real = len(real_routes)
             covered_edges = len([r for r in real_routes if r in edges_in_graph])
@@ -328,26 +441,15 @@ else:
                     missing_data.append({"src": src, "dst": dst, "reason": status})
 
                 # Print Statistics
-                print(
-                    f"    - New Routes (src/dst both in Graph): {counts['Both_Nodes_Exist']} ({counts['Both_Nodes_Exist']/missing_count:.1%})")
-                print(
-                    f"     -> SUCCESS: Added {added_count} new routes to the Graph! The network is now up-to-date.")
+                print(f"    - New Routes (src/dst both in Graph): {counts['Both_Nodes_Exist']} ({counts['Both_Nodes_Exist']/missing_count:.1%})")
+                print(f"     -> SUCCESS: Added {added_count} new routes to the Graph! The network is now up-to-date.")
                 print(f"     -> New Graph Stats: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges.")
-                print(
-                    f"    - Dead End (Only Source in Graph):     {counts['Only_Src_Exists']} ({counts['Only_Src_Exists']/missing_count:.1%})")
-                print(
-                    f"    - Incoming (Only Dest in Graph):       {counts['Only_Dst_Exists']} ({counts['Only_Dst_Exists']/missing_count:.1%})")
-                print(
-                    f"    - Unknown (Neither in Graph):          {counts['Neither_Exists']} ({counts['Neither_Exists']/missing_count:.1%})")
-
-                # Export CSV
-                miss_csv_path = os.path.join(CSV_DIR, "missing_routes_analysis.csv")
-                pd.DataFrame(missing_data).to_csv(miss_csv_path, index=False)
-                print(f"-> Detailed missing routes saved to: {miss_csv_path}")
+                print(f"    - Dead Ends (Only Src in Graph):      {counts['Only_Src_Exists']} ({(counts['Only_Src_Exists'])/missing_count:.1%})")
+                print(f"    - Incoming (Only Dest in Graph):      {counts['Only_Dst_Exists']} ({counts['Only_Dst_Exists']/missing_count:.1%})")
+                print(f"    - Unknown (Neither in Graph):         {counts['Neither_Exists']} ({counts['Neither_Exists']/missing_count:.1%})")
 
         else:
-            print("\nNo raw route data available in memory for edge verification.")
-        # ---------------------------------------------------------
+            print("\nNo raw route data available for edge verification.")
 
         print("\nSaving Checkpoint Phase 1...")
         pd.to_pickle((df_master_nodes, G), ckpt_path_fase1)
@@ -386,7 +488,6 @@ plt.grid(True, linestyle=':', alpha=0.6)
 plt.savefig(os.path.join(PLOT_DIR, "01b_geo_coverage.png"))
 plt.close()
 print("-> Saved: 01b_geo_coverage.png")
-
 
 # --- PLOT 3: VOLUME VS DELAY (Efficiency Check) ---
 if not df_with_data.empty and 'num_flights' in df_with_data.columns:
@@ -452,296 +553,227 @@ if USE_CHECKPOINTS and os.path.exists(ckpt_path_fase2):
 else:
     print("Calculating Network Centrality Measures...")
 
-    # A. GIANT CONNECTED COMPONENT (GCC) EXTRACTION
-    # Path-based metrics (Closeness, Diameter) require a connected graph.
-    print("    - Extracting Giant Connected Component (GCC) for path metrics...")
     gcc_nodes = max(nx.connected_components(G.to_undirected()), key=len)
     G_gcc = G.subgraph(gcc_nodes).copy()
 
-    # 1. Degree Centrality (Connectivity)
-    print("    - Calculating In-Degree and Out-Degree...")
+    print("    - Calculating Degrees...")
     in_degree_dict = dict(G.in_degree())
     out_degree_dict = dict(G.out_degree())
-    total_degree_dict = dict(G.degree())  # Sum of In + Out
+    total_degree_dict = dict(G.degree())
 
     df_master_nodes["in_degree"] = df_master_nodes["IATA"].map(in_degree_dict)
     df_master_nodes["out_degree"] = df_master_nodes["IATA"].map(out_degree_dict)
     df_master_nodes["degree"] = df_master_nodes["IATA"].map(total_degree_dict)
 
-    # 2. PageRank (Global Importance)
-    print("    - Calculating PageRank (alpha=0.85)...")
+    print("    - Calculating PageRank...")
     pagerank_dict = nx.pagerank(G, alpha=0.85)
     df_master_nodes["pagerank"] = df_master_nodes["IATA"].map(pagerank_dict)
 
-    # 3. Betweenness Centrality (Bottleneck Potential)
-    print("    - Calculating Betweenness (Approx k=500)...")
+    print("    - Calculating Betweenness...")
     betweenness_dict = nx.betweenness_centrality(G, k=500, normalized=True, seed=42)
     df_master_nodes["betweenness"] = df_master_nodes["IATA"].map(betweenness_dict)
 
-    # 4. Closeness Centrality (Accessibility Speed) - NEW!
-    # Calculated on GCC to avoid infinite distance errors, then mapped back.
-    print("    - Calculating Closeness Centrality (on GCC)...")
+    print("    - Calculating Closeness (GCC)...")
     closeness_gcc = nx.closeness_centrality(G_gcc)
     df_master_nodes["closeness"] = df_master_nodes["IATA"].map(closeness_gcc)
 
-    # 5. Assortativity & Mixing Patterns
-    # r < 0: Disassortative (Hubs connect to spokes) -> Typical of Hub & Spoke
-    print("    - Calculating Global Assortativity Coefficient...")
+    print("    - Calculating Assortativity...")
     assortativity = nx.degree_assortativity_coefficient(G)
 
-    # 6. Average Nearest Neighbor Degree (ANND) - NEW!
-    # We calculate k_nn to verify if high-degree nodes connect to low-degree nodes.
-    print("    - Calculating Average Nearest Neighbor Degree (ANND)...")
+    print("    - Calculating ANND...")
     knn_dict = nx.average_neighbor_degree(G)
     df_master_nodes["knn"] = df_master_nodes["IATA"].map(knn_dict)
 
-    # ---------------------------
-    # PRINT SUMMARY STATISTICS
-    # ---------------------------
+    df_master_nodes["closeness"] = df_master_nodes["closeness"].fillna(0.0)
+    df_master_nodes["betweenness"] = df_master_nodes["betweenness"].fillna(0.0)
+    df_master_nodes["pagerank"] = df_master_nodes["pagerank"].fillna(0.0)
+
+    cols_to_analyze = [
+        "in_degree", "out_degree", "degree",
+        "pagerank", "betweenness", "closeness", "knn"
+    ]
+
+    if "avg_delay" in df_master_nodes.columns:
+        cols_to_analyze.append("avg_delay")
+
     print("\nNetwork Centrality Summary:")
-    print(f"    - GCC Size: {len(G_gcc)} nodes ({len(G_gcc)/len(G):.1%} of total)")
-    print(f"    - In-Degree: min={df_master_nodes['in_degree'].min()}, max={df_master_nodes['in_degree'].max()}, mean={df_master_nodes['in_degree'].mean():.2f}")
-    print(f"    - Out-Degree: min={df_master_nodes['out_degree'].min()}, max={df_master_nodes['out_degree'].max()}, mean={df_master_nodes['out_degree'].mean():.2f}")
-    print(f"    - Total Degree: min={df_master_nodes['degree'].min()}, max={df_master_nodes['degree'].max()}, mean={df_master_nodes['degree'].mean():.2f}")
-    print(f"    - PageRank: min={df_master_nodes['pagerank'].min():.6f}, max={df_master_nodes['pagerank'].max():.6f}, mean={df_master_nodes['pagerank'].mean():.6f}")
-    print(f"    - Betweenness: min={df_master_nodes['betweenness'].min():.6f}, max={df_master_nodes['betweenness'].max():.6f}, mean={df_master_nodes['betweenness'].mean():.6f}")
-    if 'closeness' in df_master_nodes.columns:
-        print(f"    - Closeness: min={df_master_nodes['closeness'].min():.4f}, max={df_master_nodes['closeness'].max():.4f}, mean={df_master_nodes['closeness'].mean():.4f}")
+    print(f"    - GCC Size:            {len(G_gcc)} nodes ({len(G_gcc)/len(G):.1%} of total)")
+    print(f"    - Assortativity:       {assortativity:.4f}")
 
-    assortativity = nx.degree_assortativity_coefficient(G)
-    print(f"    - Global Assortativity Coefficient: {assortativity:.4f}")
+    stats = df_master_nodes[cols_to_analyze].describe().T
 
-    knn_stats = df_master_nodes['knn'].describe()
-    print(f"    - Average Neighbor Degree: min={knn_stats['min']:.2f}, max={knn_stats['max']:.2f}, mean={knn_stats['mean']:.2f}")
+    display_map = {
+        "in_degree": "In-Degree", "out_degree": "Out-Degree", "degree": "Total Degree",
+        "pagerank": "PageRank", "betweenness": "Betweenness", "closeness": "Closeness",
+        "knn": "Avg Neighbor Degree", "avg_delay": "Average Delay"
+    }
 
-    # Optional: top-k nodes by key metrics
+    for col in cols_to_analyze:
+        if col in stats.index:
+            row = stats.loc[col]
+            name = display_map.get(col, col)
+            print(f"    - {name:<20} min={row['min']:.4f}, max={row['max']:.4f}, mean={row['mean']:.4f}")
+
     top_k = 5
-    print("\nTop nodes by PageRank:")
-    print(df_master_nodes.nlargest(top_k, "pagerank")[["IATA", "pagerank"]])
+    print(f"\nTop {top_k} nodes by PageRank:")
+    print(df_master_nodes[["IATA", "pagerank"]].nlargest(top_k, "pagerank").to_string(index=False))
 
-    print("\nTop nodes by Betweenness:")
-    print(df_master_nodes.nlargest(top_k, "betweenness")[["IATA", "betweenness"]])
-
-    print("\nTop nodes by Closeness:")
-    if 'closeness' in df_master_nodes.columns:
-        print(df_master_nodes.nlargest(top_k, "closeness")[["IATA", "closeness"]])
+    print(f"\nTop {top_k} nodes by Betweenness:")
+    print(df_master_nodes[["IATA", "betweenness"]].nlargest(top_k, "betweenness").to_string(index=False))
 
     print("\nSaving Checkpoint Phase 2...")
     pd.to_pickle(df_master_nodes, ckpt_path_fase2)
 
 # --- 2.2 ASSORTATIVITY ANALYSIS (ANND PLOT) ---
-# This visualizes the correlation between a node's degree and its neighbors' degree.
-print("\nDeep Dive on Assortativity (ANND)...")
-
-# Plot: Out-Degree (Hub capacity) vs Average In-Degree of neighbors (Destination popularity)
+# ASSORTIVITY Plot: Out-Degree vs Average Neighbor In-Degree
+print("Analyzing Assortativity Trends...")
 df_annd = df_master_nodes.dropna(subset=["out_degree", "knn"])
-# Filter noise: remove nodes with degree 0 or very small
 df_annd = df_annd[df_annd["out_degree"] > 0]
-
 k_vs_knn = df_annd.groupby("out_degree")["knn"].mean().reset_index()
 
 plt.figure(figsize=(8, 6))
 sns.scatterplot(x='out_degree', y='knn', data=k_vs_knn, color='purple', alpha=0.6, label='Observed Data')
-
-# Trend line (linear regression in log-log space)
 if len(k_vs_knn) > 1:
     z = np.polyfit(k_vs_knn['out_degree'], k_vs_knn['knn'], 1)
     p = np.poly1d(z)
     plt.plot(k_vs_knn['out_degree'], p(k_vs_knn['out_degree']), "r--", label=f'Trend Slope: {z[0]:.4f}')
-
 plt.title("Assortativity: Out-Degree vs Neighbor In-Degree")
 plt.xlabel("Node Out-Degree ($k_{out}$)")
 plt.ylabel("Average Neighbor In-Degree ($k_{nn}^{in}$)")
-plt.legend()
-plt.grid(True, linestyle=':', alpha=0.6)
-plt.xscale('log')
-plt.yscale('log')
+plt.xscale('log'); plt.yscale('log')
+plt.grid(True, linestyle=':', alpha=0.6); plt.legend()
 plt.savefig(os.path.join(PLOT_DIR, "02a_assortativity_annd.png"))
 plt.close()
 print("-> Saved: 02a_assortativity_annd.png")
 
-# --- 2.3 SCALE-FREE VALIDATION (DUAL METHOD) ---
-# We compare two methods to estimate the Scaling Exponent (Gamma):
-# A. Classic PDF: Plotting P(k) vs k. Intuitive but noisy in the tail.
-# B. Robust CCDF: Plotting P(K >= k) vs k. Eliminates noise and binning bias.
-
+# SCALE-FREE Analysis: PDF vs CCDF
 print("\nVerifying Scale-Free Property (PDF vs CCDF)...")
 degrees = [d for n, d in G.degree() if d > 0]
 
-# --- METHOD A: CLASSIC LOG-LOG PDF + REGRESSION ---
-print("    - Method A: Classic Degree Distribution (PDF)...")
+# METHOD A: Classic PDF
 degree_counts = pd.Series(degrees).value_counts().sort_index()
 x_pdf = degree_counts.index.values
-y_pdf = degree_counts.values / sum(degree_counts.values)  # P(k) probability
-
-# Linear Regression on Log-Log data
-# log(P(k)) = -gamma * log(k) + c
-log_x_pdf = np.log(x_pdf)
-log_y_pdf = np.log(y_pdf)
+y_pdf = degree_counts.values / sum(degree_counts.values)
+log_x_pdf = np.log(x_pdf); log_y_pdf = np.log(y_pdf)
 coeffs_pdf = np.polyfit(log_x_pdf, log_y_pdf, 1)
-gamma_pdf = -coeffs_pdf[0]  # Slope is -gamma
+gamma_pdf = -coeffs_pdf[0]
 
-print(f"      Estimated Gamma (PDF Method): {gamma_pdf:.2f}")
-
-plt.figure(figsize=(8, 6))
+plt.figure(figsize=(8, 5))
 plt.loglog(x_pdf, y_pdf, 'bo', alpha=0.5, label='Observed P(k)')
-plt.loglog(x_pdf, np.exp(np.polyval(coeffs_pdf, log_x_pdf)), 'r--', linewidth=2,
-           label=f'Fit ($\gamma={gamma_pdf:.2f}$)')
+plt.loglog(x_pdf, np.exp(np.polyval(coeffs_pdf, log_x_pdf)), 'r--', label=f'Fit ($\gamma={gamma_pdf:.2f}$)')
 plt.title(f"A. Classic Degree Distribution (PDF)\nGamma ~ {gamma_pdf:.2f}")
-plt.xlabel("Degree (k)")
-plt.ylabel("Probability P(k)")
-plt.legend()
-plt.grid(True, which="both", ls="--", alpha=0.4)
+plt.xlabel("Degree (k)"); plt.ylabel("P(k)"); plt.legend(); plt.grid(True, which="both", ls="--", alpha=0.4)
 plt.savefig(os.path.join(PLOT_DIR, "02b_power_law_pdf_classic.png"))
 plt.close()
 
-
-# --- METHOD B: ROBUST CCDF (Complementary Cumulative Distribution) ---
-print("    - Method B: Robust CCDF (Cumulative)...")
-
+# METHOD B: Robust CCDF
 def get_ccdf_distribution(degrees):
-    """
-    Calculates P(K >= k).
-    Method: Sort data and calculate rank frequencies.
-    """
-    degrees = np.array(degrees)
-    degrees_sorted = np.sort(degrees)
-
-    n = len(degrees_sorted)
-    ranks = np.arange(n)
-    # fraction of nodes with degree >= k
-    ccdf = 1 - (ranks / n)
-
+    degrees_sorted = np.sort(np.array(degrees))
+    ccdf = 1 - (np.arange(len(degrees_sorted)) / len(degrees_sorted))
     return degrees_sorted, ccdf
 
-
 x_ccdf, y_ccdf = get_ccdf_distribution(degrees)
+log_x_c = np.log(x_ccdf); log_y_c = np.log(y_ccdf)
+coeffs_c = np.polyfit(log_x_c, log_y_c, 1)
+gamma_ccdf = 1 - coeffs_c[0]
 
-# Linear Regression on CCDF
-# log(P(K>=k)) = -(gamma - 1) * log(k) + c
-# So: Gamma = 1 - slope
-log_x_ccdf = np.log(x_ccdf)
-log_y_ccdf = np.log(y_ccdf)
-
-coeffs_ccdf = np.polyfit(log_x_ccdf, log_y_ccdf, 1)
-slope_ccdf = coeffs_ccdf[0]
-gamma_ccdf = 1 - slope_ccdf
-
-print(f"      Estimated Gamma (CCDF Method): {gamma_ccdf:.2f}")
-
-plt.figure(figsize=(8, 6))
-plt.loglog(x_ccdf, y_ccdf, 'b.', markersize=5, alpha=0.5, label='Observed CCDF')
-plt.loglog(x_ccdf, np.exp(np.polyval(coeffs_ccdf, log_x_ccdf)), 'r--', linewidth=2,
-           label=f'Fit ($\gamma={gamma_ccdf:.2f}$)')
+plt.figure(figsize=(8, 5))
+plt.loglog(x_ccdf, y_ccdf, 'b.', alpha=0.5, label='Observed CCDF')
+plt.loglog(x_ccdf, np.exp(np.polyval(coeffs_c, log_x_c)), 'r--', label=f'Fit ($\gamma={gamma_ccdf:.2f}$)')
 plt.title(f"B. Robust Cumulative Distribution (CCDF)\nGamma ~ {gamma_ccdf:.2f}")
-plt.xlabel("Degree (k)")
-plt.ylabel("P(K $\geq$ k)")
-plt.legend()
-plt.grid(True, which="both", ls="--", alpha=0.4)
+plt.xlabel("Degree (k)"); plt.ylabel("P(K $\geq$ k)"); plt.legend(); plt.grid(True, which="both", ls="--", alpha=0.4)
 plt.savefig(os.path.join(PLOT_DIR, "02b_power_law_ccdf_robust.png"))
 plt.close()
 
 print("-> Saved: 02b_power_law_pdf_classic.png & 02b_power_law_ccdf_robust.png")
+print(f"Gamma Estimates -> PDF: {gamma_pdf:.2f}, CCDF: {gamma_ccdf:.2f}")
 
-# --- 2.4 CORRELATION ANALYSIS (PEARSON VS SPEARMAN) ---
+# CORRELATION Analysis: Betweenness vs Average Delay
 print("\nTesting the 'Fragility Paradox' (Centrality vs Inefficiency)...")
-df_analysis = df_master_nodes.dropna(subset=["avg_delay", "betweenness", "pagerank"]).copy()
 
-if not df_analysis.empty:
-    # Pearson checks for linear relationship. Spearman checks for monotonic relationship (rank).
-    # Since delays are highly skewed (non-normal), Spearman is the more robust metric here.
+if "avg_delay" in df_master_nodes.columns and "betweenness" in df_master_nodes.columns:
+    df_valid = df_master_nodes.dropna(subset=["betweenness", "avg_delay"])
 
-    p_corr, p_val = stats.pearsonr(df_analysis["betweenness"], df_analysis["avg_delay"])
-    s_corr, s_val = stats.spearmanr(df_analysis["betweenness"], df_analysis["avg_delay"])
+    if not df_valid.empty:
+        # Pearson (Pandas)
+        pearson_val = df_valid["betweenness"].corr(df_valid["avg_delay"], method="pearson")
 
-    print(f"    - Pearson Correlation:  {p_corr:.4f} (p-value: {p_val:.2e})")
-    print(f"    - Spearman Correlation: {s_corr:.4f} (p-value: {s_val:.2e})")
+        # Spearman (Scipy)
+        s_corr, s_val = scipy_stats.spearmanr(df_valid["betweenness"], df_valid["avg_delay"])
 
-    if s_corr > 0.1:
-        conclusion = "CONFIRMED: Central Hubs tend to have higher delays."
-    elif s_corr < -0.1:
-        conclusion = "REJECTED: Central Hubs are actually more efficient."
+        print(f"    - Pearson Correlation (Pandas):  {pearson_val:.4f}")
+        print(f"    - Spearman Correlation (Scipy): {s_corr:.4f} (p-value: {s_val:.2e})")
+
+        if s_corr > 0.1:
+            conclusion = "CONFIRMED: Central Hubs tend to have higher delays."
+        elif s_corr < -0.1:
+            conclusion = "REJECTED: Central Hubs are actually more efficient."
+        else:
+            conclusion = "INCONCLUSIVE: No strong correlation found."
+        print(f"Hypothesis Test: {conclusion}")
+
+        # Plot
+        plt.figure(figsize=(10, 6))
+        sns.regplot(
+            x='betweenness', y='avg_delay',
+            data=df_valid,
+            scatter_kws={'alpha': 0.5, 'color': 'steelblue'},
+            line_kws={'color': 'red', 'label': f'Spearman Trend ({s_corr:.2f})'}
+        )
+        plt.title('Fragility Paradox: Betweenness vs Delay')
+        plt.xlabel('Betweenness Centrality')
+        plt.ylabel('Avg Delay (min)')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.savefig(os.path.join(PLOT_DIR, "02c_fragility_correlation.png"))
+        plt.close()
+        print("-> Saved: 02c_fragility_correlation.png")
     else:
-        conclusion = "INCONCLUSIVE: No strong correlation found."
-    print(f"Hypothesis Test: {conclusion}")
+        print("Not enough data for correlation analysis.")
+else:
+    print("Warning: 'avg_delay' or 'betweenness' column missing.")
 
-    # Scatter Plot
-    plt.figure(figsize=(10, 6))
-    sns.regplot(
-        x='betweenness', y='avg_delay',
-        data=df_analysis,
-        scatter_kws={'alpha': 0.5, 'color': 'steelblue'},
-        line_kws={'color': 'red', 'label': f'Spearman Trend ({s_corr:.2f})'}
-    )
-
-    plt.title(f'Fragility Paradox: Betweenness vs Delay\n(Spearman: {s_corr:.2f}, p<{s_val:.1e})')
-    plt.xlabel('Betweenness Centrality')
-    plt.ylabel('Average Departure Delay (min)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(PLOT_DIR, "02c_fragility_correlation.png"))
-    plt.close()
-    print("-> Saved: 02c_fragility_correlation.png")
-
-# --- 2.5 ROBUSTNESS SIMULATION (TARGETED ATTACKS) ---
-print("\nRunning Network Disintegration Test...")
-
-
+# ROBUSTNESS test: Random vs Targeted Attacks
+print("\nRunning Network Disintegration Test (Local Simulation)...")
 def get_giant_component_fraction(g_curr, original_n):
-    if len(g_curr) == 0:
-        return 0
+    if len(g_curr) == 0: return 0
     gc = max(nx.weakly_connected_components(g_curr), key=len)
     return len(gc) / original_n
 
-
-fractions = np.linspace(0, 0.20, 11)  # 0% to 20% removal
+fractions = np.linspace(0, 0.20, 11)
 results = {"Random": [], "Structural": [], "Operational": []}
 original_nodes = G.number_of_nodes()
 
-# Define Attack Strategies
-nodes_list = list(G.nodes())
-random.shuffle(nodes_list)
-random_attack = list(nodes_list)
+# Using Spark to sort nodes by centrality and delay for targeted attacks
+df_prep = df_master_nodes.fillna({'pagerank': 0.0, 'avg_delay': 0.0})
 
-structural_attack = df_master_nodes.sort_values("pagerank", ascending=False)["IATA"].tolist()
-structural_attack = [n for n in structural_attack if n in G]
-
-operational_attack = df_master_nodes.sort_values("avg_delay", ascending=False)["IATA"].tolist()
-operational_attack = [n for n in operational_attack if n in G]
+random_attack = list(G.nodes()); random.shuffle(random_attack)
+structural_attack = df_prep.sort_values("pagerank", ascending=False)["IATA"].tolist()
+operational_attack = df_prep.sort_values("avg_delay", ascending=False)["IATA"].tolist()
 
 print("    - Simulating Random, Structural, and Operational failure...")
 for f in fractions:
     n_rem = int(original_nodes * f)
 
-    # 1. Random
-    G_tmp = G.copy()
-    G_tmp.remove_nodes_from(random_attack[:n_rem])
-    results["Random"].append(get_giant_component_fraction(G_tmp, original_nodes))
+    def simulate_attack(attack_list):
+        G_tmp = G.copy()
+        # Remove first n_rem nodes
+        targets = [n for n in attack_list[:n_rem] if n in G_tmp]
+        G_tmp.remove_nodes_from(targets)
+        return get_giant_component_fraction(G_tmp, original_nodes)
 
-    # 2. Structural (PageRank)
-    G_tmp = G.copy()
-    G_tmp.remove_nodes_from(structural_attack[:n_rem])
-    results["Structural"].append(get_giant_component_fraction(G_tmp, original_nodes))
-
-    # 3. Operational (Delay)
-    # Note: operational_attack list is shorter (~570 nodes).
-    # If n_rem > len(operational_attack), we assume the attack stops (or we could random fill).
-    # Here we simulate strictly targeting the known bad airports.
-    G_tmp = G.copy()
-    targets = operational_attack[:min(n_rem, len(operational_attack))]
-    G_tmp.remove_nodes_from(targets)
-    results["Operational"].append(get_giant_component_fraction(G_tmp, original_nodes))
+    results["Random"].append(simulate_attack(random_attack))
+    results["Structural"].append(simulate_attack(structural_attack))
+    results["Operational"].append(simulate_attack(operational_attack))
 
 plt.figure(figsize=(10, 6))
 plt.plot(fractions, results["Random"], '--', color='gray', label="Random Failure")
-plt.plot(fractions, results["Structural"], 'o-', color='firebrick', label="Structural Attack (PageRank)")
-plt.plot(fractions, results["Operational"], 's-', color='orange', label="Operational Collapse (High Delay)")
-
+plt.plot(fractions, results["Structural"], 'o-', color='firebrick', label="Structural Attack")
+plt.plot(fractions, results["Operational"], 's-', color='orange', label="Operational Collapse")
 plt.title("Network Robustness: Structural vs Operational Disintegration")
 plt.xlabel("Fraction of Nodes Removed")
 plt.ylabel("Giant Component Size (Normalized)")
 plt.legend()
-plt.grid(True, alpha=0.3)
 plt.savefig(os.path.join(PLOT_DIR, "02d_robustness_simulation.png"))
 plt.close()
 print("-> Saved: 02d_robustness_simulation.png")
@@ -763,61 +795,42 @@ if os.path.exists(ckpt_path_fase2):
 else:
     raise FileNotFoundError("Phase 2 Checkpoint not found. Run Phase 2 first.")
 
-# We select a mix of structural and operational features for clustering
-features = ['pagerank', 'betweenness', 'avg_delay', 'delay_variance', 'degree']
+print("Preparing Feature Matrix for Clustering...")
 
-# Drop missing values
-df_model = df_clustering.dropna(subset=features).copy()
-print(f"    - Data points available for clustering: {len(df_model)}")
+# Selection of features for clustering (only those with good coverage and relevance)
+features_cols = ['pagerank', 'betweenness', 'avg_delay', 'delay_variance', 'degree']
 
-# Scaling (StandardScaler is crucial because PageRank is ~0.0001 and Delay is ~100.0)
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(df_model[features])
+# Drop missing values (ML don't accept Null)
+df_model_pd = df_master_nodes.dropna(subset=features_cols).copy()
+print(f"    - Data points available for clustering: {len(df_model_pd)}")
 
-# --- 3.2 HIERARCHICAL CLUSTERING (Exploratory Analysis) ---
-print("\nHierarchical Clustering (Dendrogram)...")
-# Consider only the top 100 airports by PageRank for the dendrogram to avoid clutter and focus on key nodes
-top_100_indices = df_model.sort_values("pagerank", ascending=False).head(100).index
-X_sample = df_model.loc[top_100_indices][features]
-X_sample_scaled = scaler.transform(X_sample)
+scaler = SklearnScaler()
+X = df_model_pd[features_cols].values
+X_scaled = scaler.fit_transform(X)
 
-plt.figure(figsize=(12, 7))
-plt.title("Dendrogram (Top 100 Airports) - Ward Linkage")
-dend = shc.dendrogram(shc.linkage(X_sample_scaled, method='ward'))
-plt.axhline(y=15, color='r', linestyle='--', label="Suggested Cut")
-plt.xlabel("Airport Indices")
-plt.ylabel("Euclidean Distances")
-plt.legend()
-plt.savefig(os.path.join(PLOT_DIR, "03a_dendrogram_ward.png"))
-plt.close()
-print("-> Saved: 03a_dendrogram_ward.png")
-
-# --- 3.3 K-MEANS SEGMENTATION & VALIDATION ---
-print("\nK-Means Clustering (Grid Search & Validation)...")
-
+# K-MEANS GRID SEARCH
+print("\nRunning K-Means Grid Search...")
 k_range = range(2, 7)
 results = []
 
-print("    - Validating using Silhouette, Davies-Bouldin, and Calinski-Harabasz metrics...")
 print(f"    - Testing k from {min(k_range)} to {max(k_range)}...")
+
 for k in k_range:
-    # n_jobs=-1 enables parallel processing
-    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    # Train
+    kmeans = SklearnKMeans(n_clusters=k, random_state=42, n_init=10)
     labels = kmeans.fit_predict(X_scaled)
 
-    # 1. Silhouette: Cohesion vs Separation (Max is better)
+    # Metrics
     sil = silhouette_score(X_scaled, labels)
-    # 2. Davies-Bouldin: Similarity between clusters (Min is better)
     db = davies_bouldin_score(X_scaled, labels)
-    # 3. Calinski-Harabasz: Variance Ratio (Max is better)
     ch = calinski_harabasz_score(X_scaled, labels)
 
     results.append({"k": k, "Silhouette": sil, "Davies-Bouldin": db, "Calinski-Harabasz": ch})
     print(f"      k={k} | Sil: {sil:.3f} | DB: {db:.3f} | CH: {ch:.1f}")
 
+# Plot
 df_metrics = pd.DataFrame(results)
 
-# Plot Validation Metrics
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 sns.lineplot(x='k', y='Silhouette', data=df_metrics, marker='o', ax=axes[0], color='blue')
 axes[0].set_title('Silhouette Score (Higher is better)')
@@ -828,22 +841,40 @@ axes[1].set_title('Davies-Bouldin Index (Lower is better)')
 sns.lineplot(x='k', y='Calinski-Harabasz', data=df_metrics, marker='o', ax=axes[2], color='green')
 axes[2].set_title('Calinski-Harabasz Score (Higher is better)')
 
-plt.savefig(os.path.join(PLOT_DIR, "03b_kmeans_validation_metrics.png"))
+plt.grid(True)
+plt.savefig(os.path.join(PLOT_DIR, "03a_kmeans_validation_metrics.png"))
 plt.close()
-print("-> Saved: 03b_kmeans_validation_metrics.png")
+print("-> Saved: 03a_kmeans_validation_metrics.png")
 
 # --- APPLYING OPTIMAL K-MEANS ---
-# ATTENTION: Select best cluster count based on plots and metrics above
+# SELECTION OF BEST K (Manual based on metrics)
 best_k = 3
-print(f"    -> Applying K-Means with k={best_k}...")
-kmeans_final = KMeans(n_clusters=best_k, random_state=42, n_init=10)
-df_model["cluster_kmeans"] = kmeans_final.fit_predict(X_scaled)
+print(f"Applying Final K-Means Model with k={best_k} (Manual Selection)...")
 
-# --- 3.4 DBSCAN & OUTLIER DETECTION ---
-print("\nDBSCAN for Outlier Detection...")
+# We need to re-train the model with k=3 because the previous loop ended at k=6
+kmeans_final = SklearnKMeans(n_clusters=best_k, random_state=42, n_init=10)
+df_model_pd["cluster_kmeans"] = kmeans_final.fit_predict(X_scaled)
 
-# 1. k-Distance Graph to find EPS
-# ATTENTION: Select min_samples based on expected cluster density
+# HIERARCHICAL & DBSCAN clustering
+print("\nExploratory Analysis (Hierarchical & DBSCAN)...")
+print("    - Hierarchical Clustering (Top 100 Dendrogram)...")
+
+top_100_indices = df_model_pd.sort_values("pagerank", ascending=False).head(100).index
+X_sample = df_model_pd.loc[top_100_indices, features_cols].values
+X_sample_scaled = scaler.transform(X_sample)
+
+plt.figure(figsize=(12, 7))
+plt.title("Dendrogram (Top 100 Airports)")
+dend = shc.dendrogram(shc.linkage(X_sample_scaled, method='ward'))
+plt.axhline(y=15, color='r', linestyle='--', label="Suggested Cut")
+plt.legend()
+plt.savefig(os.path.join(PLOT_DIR, "03b_dendrogram_ward.png"))
+plt.close()
+print("-> Saved: 03b_dendrogram_ward.png")
+
+# DBSCAN for Outlier Detection
+print("    - DBSCAN for Outlier Detection...")
+# Parameters: eps and min_samples need to be tuned. We use k-distance graph.
 min_samples = 5
 neighbors = NearestNeighbors(n_neighbors=min_samples)
 neighbors_fit = neighbors.fit(X_scaled)
@@ -852,74 +883,64 @@ distances = np.sort(distances[:, min_samples-1], axis=0)
 
 plt.figure(figsize=(10, 6))
 plt.plot(distances)
-plt.title(f"k-Distance Graph (k={min_samples}) for DBSCAN Tuning")
-plt.xlabel("Points sorted by distance")
-plt.ylabel(f"Epsilon (Dist to {min_samples}-th neighbor)")
+plt.title("k-Distance Graph for DBSCAN")
+plt.xlabel("Points sorted by distance"); plt.ylabel("Epsilon distance")
 plt.grid(True)
 plt.savefig(os.path.join(PLOT_DIR, "03c_dbscan_kdist_plot.png"))
 plt.close()
 print("-> Saved: 03c_dbscan_kdist_plot.png")
 
-# 2. Apply DBSCAN
-# ATTENTION: Set eps_value based on the "elbow" observed in the k-distance graph above
+# Apply DBSCAN (eps=1.0 empirical, adjust if the graph suggests otherwise)
 eps_value = 1.0
-dbscan = DBSCAN(eps=eps_value, min_samples=min_samples)
-df_model["cluster_dbscan"] = dbscan.fit_predict(X_scaled)
+dbscan = SklearnDBSCAN(eps=eps_value, min_samples=min_samples)
+df_model_pd["cluster_dbscan"] = dbscan.fit_predict(X_scaled)
 
-n_outliers = list(df_model["cluster_dbscan"]).count(-1)
+n_outliers = list(df_model_pd["cluster_dbscan"]).count(-1)
 print(f"    -> DBSCAN found {n_outliers} outliers (Noise points labeled as -1)")
 
-# --- 3.5 DIMENSIONALITY REDUCTION & VISUALIZATION ---
+# VISUALIZATION (PCA)
 print("\nPCA Projection & Profiling...")
 
-# PCA to 2D
 pca = PCA(n_components=2)
 principalComponents = pca.fit_transform(X_scaled)
-df_model['pca_1'] = principalComponents[:, 0]
-df_model['pca_2'] = principalComponents[:, 1]
-print(f"    - PCA Explained Variance Ratio: {pca.explained_variance_ratio_}")
+df_model_pd['pca_1'] = principalComponents[:, 0]
+df_model_pd['pca_2'] = principalComponents[:, 1]
 
-# Plot K-Means Clusters
+# Plot K-Means Clusters (Calculated by Spark)
 plt.figure(figsize=(10, 8))
 sns.scatterplot(
     x="pca_1", y="pca_2", hue="cluster_kmeans",
-    data=df_model, palette="viridis", s=60, alpha=0.8
+    data=df_model_pd, palette="viridis", s=60, alpha=0.8
 )
-plt.title(f"Airport Clusters (K-Means k={best_k}) on PCA")
+plt.title(f"Airport Clusters (K-Means k={best_k}) on PCA Projection")
 plt.savefig(os.path.join(PLOT_DIR, "03d_pca_kmeans_clusters.png"))
 plt.close()
 print("-> Saved: 03d_pca_kmeans_clusters.png")
 
 # Plot DBSCAN Outliers
 plt.figure(figsize=(10, 8))
-# Highlight outliers (Cluster -1) in Red, others in Grey
-colors = np.where(df_model["cluster_dbscan"] == -1, 'red', 'lightgray')
-plt.scatter(df_model["pca_1"], df_model["pca_2"], c=colors, s=60, alpha=0.6)
-# Add legend manually
-red_patch = mpatches.Patch(color='red', label='Outliers (Noise)')
-gray_patch = mpatches.Patch(color='lightgray', label='Normal Data')
+colors = np.where(df_model_pd["cluster_dbscan"] == -1, 'red', 'lightgray')
+plt.scatter(df_model_pd["pca_1"], df_model_pd["pca_2"], c=colors, s=60, alpha=0.6)
+red_patch = mpatches.Patch(color='red', label='Outliers')
+gray_patch = mpatches.Patch(color='lightgray', label='Normal')
 plt.legend(handles=[red_patch, gray_patch])
-plt.title("DBSCAN Outlier Detection on PCA")
+plt.title("DBSCAN Outlier Detection")
 plt.savefig(os.path.join(PLOT_DIR, "03e_pca_dbscan_outliers.png"))
 plt.close()
 print("-> Saved: 03e_pca_dbscan_outliers.png")
 
-# --- 3.6 PROFILING (SEMANTIC INTERPRETATION) ---
-# Boxplots to understand "Who are these clusters?"
+# PROFILING (Boxplots)
 print("    - Generating Profiling Boxplots...")
 fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
-# Boxplot 1: Delay
-sns.boxplot(x='cluster_kmeans', y='avg_delay', data=df_model, ax=axes[0], palette="Set2")
+sns.boxplot(x='cluster_kmeans', y='avg_delay', data=df_model_pd, ax=axes[0], palette="Set2")
 axes[0].set_title("Operational Efficiency (Delay)")
 
-# Boxplot 2: PageRank
-sns.boxplot(x='cluster_kmeans', y='pagerank', data=df_model, ax=axes[1], palette="Set2")
+sns.boxplot(x='cluster_kmeans', y='pagerank', data=df_model_pd, ax=axes[1], palette="Set2")
 axes[1].set_yscale('log')
 axes[1].set_title("Structural Importance (PageRank)")
 
-# Boxplot 3: Degree
-sns.boxplot(x='cluster_kmeans', y='degree', data=df_model, ax=axes[2], palette="Set2")
+sns.boxplot(x='cluster_kmeans', y='degree', data=df_model_pd, ax=axes[2], palette="Set2")
 axes[2].set_yscale('log')
 axes[2].set_title("Connectivity (Degree)")
 
@@ -936,7 +957,7 @@ cols_export = [
     "cluster_kmeans", "degree"
 ]
 
-df_export = df_model.dropna(subset=["avg_delay"])[cols_export].copy()
+df_export = df_model_pd.dropna(subset=["avg_delay"])[cols_export].copy()
 df_export = df_export.sort_values("avg_delay", ascending=False)
 
 csv_delay_path = os.path.join(CSV_DIR, "global_airport_delays.csv")
@@ -944,7 +965,7 @@ df_export.to_csv(csv_delay_path, index=False)
 print(f"-> Delay Report saved to: {csv_delay_path}")
 
 print("\nSaving Checkpoint Phase 3...")
-pd.to_pickle(df_model, ckpt_path_fase3)
+pd.to_pickle(df_model_pd, ckpt_path_fase3)
 
 # ==============================================================================
 # FASE 4: RECOMMENDATION SYSTEM (LSH & SMART SWITCH)
@@ -962,20 +983,16 @@ if os.path.exists(ckpt_path_fase3):
 else:
     raise FileNotFoundError("Phase 3 Checkpoint not found.")
 
-# --- 4.1 THEORETICAL TUNING (THE S-CURVE) ---
+# THEORETICAL TUNING (THE S-CURVE)
 print("Analyzing LSH parameters (S-Curve)...")
-
-# Parameters for MinHash
 num_perm = 128
-# Choose bands (b) and rows (r) such that b * r = num_perm
-b = 32
-r = 4
+b = 32; r = 4
 threshold_theoretical = (1/b)**(1/r)
 
 print(f"    - Configuration: Perm={num_perm}, Bands={b}, Rows={r}")
 print(f"    - Theoretical Threshold: {threshold_theoretical:.2f}")
 
-# Plotting the S-Curve
+# plot
 s_values = np.linspace(0, 1, 100)
 prob_candidate = 1 - (1 - s_values**r)**b
 
@@ -983,187 +1000,151 @@ plt.figure(figsize=(8, 6))
 plt.plot(s_values, prob_candidate, color='purple', linewidth=2)
 plt.axvline(x=threshold_theoretical, color='r', linestyle='--', label=f'Threshold ~ {threshold_theoretical:.2f}')
 plt.title(f"LSH S-Curve (b={b}, r={r})")
-plt.xlabel("Jaccard Similarity (s)")
-plt.ylabel("Probability of being a Candidate")
+plt.xlabel("Jaccard Similarity")
+plt.ylabel("Probability Candidate")
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.savefig(os.path.join(PLOT_DIR, "04a_lsh_scurve.png"))
 plt.close()
 print("-> Saved: 04a_lsh_scurve.png")
 
-# --- 4.2 SIGNATURE GENERATION & INDEXING ---
-print("\nGenerating MinHash Signatures...")
+# Important: sets IATA as row key
+if "IATA" in df_model_pd.columns:
+    print("Setting 'IATA' as DataFrame Index...")
+    df_model_pd = df_model_pd.set_index("IATA")
+
+# SIGNATURE GENERATION & INDEXING
+print("\nGenerating MinHash Signatures (Local)...")
+# LSH is extremely efficient in-memory
 
 lsh = MinHashLSH(threshold=threshold_theoretical, num_perm=num_perm)
 minhashes = {}
 valid_airports = []
-sample_node = list(G.nodes())[0]
 
 start_time = time.time()
 for n in G.nodes():
     n_str = str(n)
-
-    if n_str in df_recsys.index:
+    if n_str in df_model_pd.index:
         destinations = list(G.successors(n))
         if destinations:
             m = MinHash(num_perm=num_perm)
             for d in destinations:
                 m.update(str(d).encode('utf8'))
-
             minhashes[n_str] = m
             lsh.insert(n_str, m)
             valid_airports.append(n_str)
 
 print(f"    - Indexed {len(valid_airports)} airports in {time.time() - start_time:.2f} seconds.")
 
-if len(valid_airports) == 0:
-    print("\n[ERROR] No airports indexed! Checking mismatch...")
-    print(f"    -> Graph Nodes Sample: {list(G.nodes())[:5]}")
-    print(f"    -> DataFrame Index Sample: {df_recsys.index[:5].tolist()}")
-    raise ValueError("Index Mismatch prevents LSH execution.")
-
-# --- 4.3 EFFICIENCY BENCHMARK (BRUTE FORCE vs LSH) ---
+# EFFICIENCY BENCHMARK
 print("\nTesting Computational Efficiency (Brute Force vs LSH)...")
-
 sample_size = 50
-if len(valid_airports) < sample_size:
-    sample_size = len(valid_airports)
-
-sample_nodes = valid_airports[:sample_size]
+sample_nodes = valid_airports[:min(len(valid_airports), sample_size)]
 
 # Brute Force
 start_bf = time.time()
 for n1 in sample_nodes:
     set1 = set(G.successors(n1)) if n1 in G else set()
     for n2 in valid_airports:
-        if n1 == n2:
-            continue
+        if n1 == n2: continue
         set2 = set(G.successors(n2)) if n2 in G else set()
-
-        if len(set1) == 0 or len(set2) == 0:
-            continue
-
-        intersection = len(set1.intersection(set2))
-        union = len(set1.union(set2))
-        j_sim = intersection / union
-end_bf = time.time()
-avg_bf_time = (end_bf - start_bf) / sample_size
-print(f"    - Brute Force Avg Time per Query: {avg_bf_time:.4f} seconds")
+        if not set1 or not set2: continue
+        _ = len(set1.intersection(set2)) / len(set1.union(set2))
+avg_bf_time = (time.time() - start_bf) / sample_size
 
 # LSH Query
 start_lsh = time.time()
 for n1 in sample_nodes:
     if n1 in minhashes:
-        result = lsh.query(minhashes[n1])
-end_lsh = time.time()
-avg_lsh_time = (end_lsh - start_lsh) / sample_size
-print(f"    - LSH Avg Time per Query: {avg_lsh_time:.4f} seconds")
+        _ = lsh.query(minhashes[n1])
+avg_lsh_time = (time.time() - start_lsh) / sample_size
 
-if avg_lsh_time > 0:
-    speedup = avg_bf_time / avg_lsh_time
-else:
-    speedup = 0
-
+print(f"    - Brute Force Avg Time: {avg_bf_time:.4f} s")
+print(f"    - LSH Avg Time:         {avg_lsh_time:.4f} s")
+speedup = avg_bf_time / avg_lsh_time if avg_lsh_time > 0 else 0
 print(f"    -> Speedup Factor: {speedup:.1f}x Faster")
 
 plt.figure(figsize=(6, 4))
 plt.bar(['Brute Force', 'LSH'], [avg_bf_time, avg_lsh_time], color=['gray', 'green'])
-plt.ylabel("Avg Query Time (s)")
-plt.yscale('log')
+plt.ylabel("Avg Query Time (s)"); plt.yscale('log')
 plt.title(f"Efficiency Benchmark (Speedup: {speedup:.0f}x)")
 plt.savefig(os.path.join(PLOT_DIR, "04b_benchmark_lsh.png"))
 plt.close()
 print("-> Saved: 04b_benchmark_lsh.png")
 
-# --- 4.4 SMART SWITCH ENGINE (RECOMMENDATION) ---
+# Recommendation System
 print("\nRunning 'Smart Switch' Engine...")
 
-# A. Identify "Bottleneck" Cluster (Highest Avg Delay)
-if "cluster_kmeans" in df_recsys.columns:
-    cluster_delays = df_recsys.groupby("cluster_kmeans")["avg_delay"].mean()
+if "cluster_kmeans" in df_model_pd.columns:
+    # Identify bottleneck cluster (highest average delay)
+    cluster_delays = df_model_pd.groupby("cluster_kmeans")["avg_delay"].mean()
     bottleneck_cluster = cluster_delays.idxmax()
-    bottleneck_airports = df_recsys[df_recsys["cluster_kmeans"] == bottleneck_cluster].index.tolist()
+    bottleneck_airports = df_model_pd[df_model_pd["cluster_kmeans"] == bottleneck_cluster].index.tolist()
 
     print(f"    - Target Cluster: #{bottleneck_cluster} (Avg Delay: {cluster_delays[bottleneck_cluster]:.1f} min)")
     print(f"    - Finding alternatives for {len(bottleneck_airports)} bottlenecks...")
 
     recommendations = []
 
+    # Recommendation Loop
     for b_node in bottleneck_airports:
-        if b_node not in minhashes:
-            continue
+        if b_node not in minhashes: continue
 
-        # Query LSH for similar airports based on destination overlap
+        # LSH Query
         candidates = lsh.query(minhashes[b_node])
-
-        b_data = df_recsys.loc[b_node]
+        b_data = df_model_pd.loc[b_node]
 
         for c_node in candidates:
-            if c_node == b_node:
-                continue
+            if c_node == b_node or c_node not in df_model_pd.index: continue
+            c_data = df_model_pd.loc[c_node]
 
-            # Check if candidate exists in our master data
-            if c_node not in df_recsys.index:
-                continue
-            c_data = df_recsys.loc[c_node]
-
-            # --- BUSINESS LOGIC FILTERS ---
-
-            # Filter 1: Delay Improvement
             delay_diff = b_data["avg_delay"] - c_data["avg_delay"]
-            if delay_diff <= 5:
-                continue    # At least 5 minutes improvement
+            if delay_diff <= 5: continue # Minimum gain of 5 minutes
+            if c_data["degree"] < (0.5 * b_data["degree"]): continue # Minimum capacity 50%
 
-            # Filter 2: Capacity Constraint
-            if c_data["degree"] < (0.5 * b_data["degree"]):
-                continue    # At least 50% bottleneck's capacity
-
-            # Calculate Exact Jaccard (Validation)
-            set1 = set(G.successors(b_node))
-            set2 = set(G.successors(c_node))
-
-            if len(set1.union(set2)) == 0:
-                continue
+            # Exact Jaccard calculation for validation
+            set1 = set(G.successors(b_node)); set2 = set(G.successors(c_node))
+            if not set1.union(set2): continue
             exact_jaccard = len(set1.intersection(set2)) / len(set1.union(set2))
 
             recommendations.append({
                 "Bottleneck_Airport": b_node,
                 "Recommended_Twin": c_node,
-                "Similarity (Jaccard)": round(exact_jaccard, 3),
-                "Current_Delay": round(b_data["avg_delay"], 1),
-                "Expected_Delay": round(c_data["avg_delay"], 1),
-                "Potential_Gain (min)": round(delay_diff, 1),
+                "Similarity": float(exact_jaccard),
+                "Current_Delay": float(b_data["avg_delay"]),
+                "Expected_Delay": float(c_data["avg_delay"]),
+                "Potential_Gain": float(delay_diff),
                 "Capacity_Match": f"{int(b_data['degree'])} vs {int(c_data['degree'])}"
             })
 
-    # --- 4.5 RESULTS & EXPORT ---
-    df_recs = pd.DataFrame(recommendations)
+    # FINAL ANALYTICS
+    if recommendations:
+        print("\nAnalyzing Recommendations Score...")
+        df_recs = pd.DataFrame(recommendations)
 
-    if not df_recs.empty:
-        # Rank by Potential Gain * Similarity (Weighted Score)
-        df_recs["Score"] = df_recs["Potential_Gain (min)"] * df_recs["Similarity (Jaccard)"]
-        df_recs = df_recs.sort_values("Score", ascending=False)
+        # Calculate Smart Score
+        df_recs["Score"] = df_recs["Potential_Gain"] * df_recs["Similarity"]
+        df_recs_sorted = df_recs.sort_values("Score", ascending=False)
 
         print("\n" + "="*30)
-        print("TOP 20 SMART RECOMMENDATIONS")
+        print("TOP 20 SMART RECOMMENDATIONS (Spark Sorted)")
         print("="*30)
-        print(df_recs[[
-            "Bottleneck_Airport", "Recommended_Twin",
-            "Similarity (Jaccard)", "Current_Delay", "Expected_Delay", "Potential_Gain (min)", "Capacity_Match"
-        ]].head(20).to_string(index=False))
 
-        # Save to CSV
-        csv_path = os.path.join(CSV_DIR, "smart_switch_recommendations.csv")
-        df_recs.to_csv(csv_path, index=False)
-        print(f"\n    -> Full Report saved to: {csv_path}")
+        # Display nicely
+        display_cols = ["Bottleneck_Airport", "Recommended_Twin", "Similarity",
+                        "Current_Delay", "Potential_Gain", "Capacity_Match"]
+        print(df_recs_sorted[display_cols].head(20).to_string(index=False))
 
-        # Validation Metric: Precision of LSH
-        valid_recs = len(df_recs[df_recs["Similarity (Jaccard)"] > 0.3])
+        # Stats
+        valid_recs = len(df_recs[df_recs["Similarity"] > 0.3])
+        print(f"\n    -> Total Recommendations Found: {len(df_recs)}")
         print(f"    -> Quality Check: {valid_recs}/{len(df_recs)} recommendations have High Similarity (>0.3)")
-
+        print(f"    -> Average Potential Gain: {df_recs['Potential_Gain'].mean():.1f} min")
+        print(f"    -> Max Potential Gain:     {df_recs['Potential_Gain'].max():.1f} min")
     else:
         print("\n   [!] No valid recommendations found matching all business constraints.")
+
 else:
-    print("[ERROR] 'cluster_kmeans' column missing. Did Phase 3 run correctly?")
+    print("[ERROR] 'cluster_kmeans' column missing.")
 
 print("\nPROJECT COMPLETED SUCCESSFULLY")
